@@ -1,0 +1,582 @@
+// agent :: do.ov
+//
+// The part that makes the agent do things.
+//
+// Two jobs. The second is why this module exists.
+//
+// do_resolve(utterance) turns a plain request into a command, resolved against
+// *this* machine. Asking a model that cannot run anything how to open a browser
+// is how you get "I cannot open Google Chrome because I am running as an AI text
+// assistant" -- an answer that is true of the model and useless to the person.
+// The agent looks up what is installed and runs that.
+//
+// do_extract_commands(text) pulls commands out of a reply that never used the
+// tool protocol. A model asked about disk usage very often answers in prose
+// *and* leaves the right command in a bash fence. Throwing the fence away is how
+// an agent shrugs at a question it could have answered: the command was already
+// there, one fence away from being run.
+//
+//   import "agent/do"
+//   hit = do_resolve("what is the biggest directory in /etc")
+//   if hit["cmd"] != null { guard it, run it, show it, feed it back }
+//
+// Library, not policy: this never runs anything. It returns the command and the
+// caller applies the guard and prints the outcome -- the same split the guard
+// already uses, so the guard stays the only place that decides.
+
+// ------------------------------------------------------------- small helpers
+
+// The words of a phrase, punctuation turned into spaces. Lowercased, so "Open"
+// and "open" are one question.
+function do_words(s) {
+    clean = s.lower()
+    for ch in [",", ".", "?", "!", ":", ";", "(", ")", "\"", "'", "\t"] {
+        clean = clean.replace(ch, " ")
+    }
+    out = []
+    for w in clean.split(" ") {
+        if w != "" { out.push(w) }
+    }
+    return out
+}
+
+function do_has(words, one) {
+    for x in words {
+        if x == one { return true }
+    }
+    return false
+}
+
+// Every word in `need` is present. ("biggest directory in /etc" needs both.)
+function do_has_all(words, need) {
+    for k in need {
+        if !do_has(words, k) { return false }
+    }
+    return true
+}
+
+function do_any(words, options) {
+    for k in options {
+        if do_has(words, k) { return true }
+    }
+    return false
+}
+
+// join, written out: the runtime has a join builtin but no join method, and
+// rebuilding fences from their lines needs this a dozen times.
+function do_join(parts, sep) {
+    out = ""
+    i = 0
+    while i < len(parts) {
+        if i > 0 { out = out + sep }
+        out = out + str(parts[i])
+        i = i + 1
+    }
+    return out
+}
+
+// The text after a keyword, trimmed. do_after("open chrome", "open") -> "chrome".
+function do_after(u, word) {
+    low = " " + u.lower().trim() + " "
+    at = low.indexof(" " + word + " ")
+    if at < 0 { return "" }
+    return low.slice(at + len(word) + 2).trim()
+}
+
+// The longest path-shaped token in the utterance. Everything that opens a file
+// or a directory needs this, and models leave the path wherever it lands.
+function do_path_in(u) {
+    best = ""
+    for tok in u.replace(",", " ").replace(";", " ").replace(")", " ")
+                .replace("(", " ").replace("\"", " ").split(" ") {
+        t = tok.trim()
+        if t == "" { continue }
+        if t.startswith("/") or t.startswith("~/") or
+           t.startswith("$HOME/") or t.startswith("./") or
+           t.startswith("../") {
+            if len(t) > len(best) { best = t }
+        }
+    }
+    return best
+}
+
+// A bare name that is a file in the current directory, or a word with a slash.
+function do_word_path_in(u) {
+    best = ""
+    for tok in u.replace(",", " ").replace(";", " ").replace(")", " ")
+                .replace("(", " ").replace("\"", " ").split(" ") {
+        t = tok.trim()
+        if t == "" or t.startswith("/") or t.startswith("~") { continue }
+        if t.contains("/") and len(t) > 2 {
+            if len(t) > len(best) { best = t }
+        }
+    }
+    return best
+}
+
+// ----------------------------------------------------------- what is installed
+
+// Is this command available? `command -v` is the shell's own answer, so it is the
+// answer for every shell on every distro without maintaining a list.
+function do_have(name) {
+    if name == "" { return false }
+    r = os.run("command -v " + name + " 2>/dev/null")
+    if !r["ok"] { return false }
+    return r["stdout"].trim() != ""
+}
+
+// The first of `names` that exists on this machine.
+function do_first_of(names) {
+    for n in names {
+        if do_have(n) { return n }
+    }
+    return ""
+}
+
+// Is there a .desktop entry whose Name contains this word? Desktop apps are
+// launched by their entry, not by a binary path, which is how "open the browser"
+// works on a machine with no chrome binary.
+function do_desktop_name(app) {
+    if app == "" { return "" }
+    r = os.run("grep -h '^Name=' /usr/share/applications/*.desktop " +
+               "$HOME/.local/share/applications/*.desktop 2>/dev/null | " +
+               "sed 's/^Name=//' | sort -u")
+    if !r["ok"] { return "" }
+    low = app.lower()
+    for line in r["stdout"].split("\n") {
+        n = line.trim()
+        if n == "" { continue }
+        if n.lower() == low { return n }
+    }
+    // A substring pass, but only for a word long enough to mean something.
+    // "the" matching inside "Aether" is the failure this guards: a short word is
+    // not a name, and treating it as one launches whatever matched.
+    if len(low) < 4 { return "" }
+    for line in r["stdout"].split("\n") {
+        n = line.trim()
+        if n == "" { continue }
+        if n.lower().indexof(low) >= 0 { return n }
+    }
+    return ""
+}
+
+// ------------------------------------------------------------------ the rest
+
+// True when the token is only digits -- a port number, not a word.
+function do_is_number(t) {
+    if t == "" { return false }
+    i = 0
+    while i < len(t) {
+        c = t[i]
+        if c < "0" or c > "9" { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// The words that are never the name of the thing to open. "open the browser"
+// names nothing, and matching "the" against installed desktop entries is how an
+// agent ends up launching an editor when asked for nothing.
+function do_stopwords() {
+    return ["the", "a", "an", "my", "me", "up", "it", "this", "that", "some",
+            "any", "app", "application", "file", "files", "folder",
+            "directory", "website", "web", "page", "link", "new",
+            "window", "terminal", "please", "now", "again", "for", "in", "on",
+            "me", "you", "us", "them", "every", "all"]
+}
+
+// --------------------------------------------------------------- the intent
+
+// The browsers, by the word a person uses for them.
+function do_browsers() {
+    return {
+        "chrome":  ["google-chrome", "google-chrome-stable", "chromium",
+                    "chromium-browser"],
+        "chromium": ["chromium", "chromium-browser", "google-chrome",
+                     "google-chrome-stable"],
+        "firefox": ["firefox", "firefox-esr"],
+        "brave":   ["brave-browser"],
+        "edge":    ["microsoft-edge", "microsoft-edge-stable"],
+        "opera":   ["opera", "opera-stable"],
+        "epiphany": ["epiphany", "epiphany-browser"],
+        "qutebrowser": ["qutebrowser"],
+        // "browser" with no brand: whatever the machine happens to have.
+        "browser": ["google-chrome", "google-chrome-stable", "chromium",
+                    "chromium-browser", "firefox", "firefox-esr",
+                    "brave-browser", "microsoft-edge", "microsoft-edge-stable",
+                    "epiphany", "epiphany-browser", "qutebrowser", "opera"]
+    }
+}
+
+// "open chrome" as a command, or "" when there is nothing to open.
+//
+// Order matters: a URL is exact, a named browser is exact, a .desktop entry is a
+// match, and xdg-open is the fallback that always resolves to *something*. A
+// machine with no browser gets xdg-open with a url, which is the correct
+// behaviour -- the desktop decides, not the agent.
+function do_open(w, u) {
+    for tok in u.replace(",", " ").replace(";", " ").replace(")", " ")
+                .replace("(", " ").replace("\"", " ").split(" ") {
+        t = tok.trim()
+        if t.startswith("http://") or t.startswith("https://") or
+           t.startswith("www.") {
+            return "xdg-open " + t
+        }
+    }
+
+    browsers = do_browsers()
+    for word in w {
+        if browsers[word] != null {
+            found = do_first_of(browsers[word])
+            if found != "" { return found }
+        }
+    }
+
+    // A word after "open" that is not a browser and not a stopword: an editor, a
+    // file manager, an app. Try the binary, then the desktop entry, then
+    // xdg-open. The first non-stopword word wins, so "open the file manager" and
+    // "open the filemanager" both land on the same thing.
+    target = do_after(u, "open")
+    if target == "" { target = do_after(u, "launch") }
+    if target == "" { target = do_after(u, "start") }
+    if target != "" {
+        first = ""
+        for word in do_words(target) {
+            if do_has(do_stopwords(), word) { continue }
+            if len(word) < 2 { continue }
+            first = word
+            break
+        }
+        if first != "" {
+            if do_have(first) { return first }
+            desk = do_desktop_name(first)
+            if desk != "" { return "gtk-launch " + desk }
+            // No slash and not a command: it is a name, and on a desktop the
+            // way to open a name is to hand it to the desktop.
+            if first.contains("/") { return "xdg-open " + first }
+            if file.exists(first) { return "xdg-open " + first }
+        }
+    }
+
+    // "open" with nothing named: the file manager.
+    if file.exists("/usr/bin/thunar") or do_have("nautilus") or
+       do_have("dolphin") or do_have("nemo") {
+        fm = do_first_of(["thunar", "nautilus", "dolphin", "nemo", "caja"])
+        if fm != "" { return fm }
+    }
+    return ""
+}
+
+// The directory a question is about. Defaults to the one that was asked about,
+// so "how big is /etc" and "how big is this" are different questions.
+function do_dir_in(w, u) {
+    p = do_path_in(u)
+    if p != "" { return p }
+    wp = do_word_path_in(u)
+    if wp != "" { return wp }
+    for d in ["home", "etc", "tmp", "var", "usr", "opt", "srv", "mnt", "media"] {
+        if do_has(w, d) { return "/" + d }
+    }
+    return "."
+}
+
+// Is the person asking a question rather than giving an order?
+function do_is_question(w) {
+    return do_any(w, ["what", "whats", "how", "which", "who", "whos", "why",
+                      "where", "wheres", "when", "is", "are", "do", "does",
+                      "can", "could", "should", "would", "tell", "show",
+                      "explain", "check", "size", "biggest", "largest",
+                      "smallest", "count", "list"])
+}
+
+// Resolve a plain-English request into a command.
+//
+// Returns {"cmd": "..."} for something runnable, or {} for something this table
+// has no opinion about -- which is the signal for the caller to ask the model.
+// No guesswork: a command is only returned when the utterance clearly matches
+// and the machine clearly supports it.
+function do_resolve(u) {
+    w = do_words(u)
+    if len(w) == 0 { return {} }
+    text = u.lower().trim()
+
+    // ---------------------------------------------------------------- opening
+    if do_has(w, "open") or do_has(w, "launch") or do_has(w, "start") {
+        // "start the server" is not "open an app": it is a build step, and the
+        // model is better at it. Only resolve it when an app was actually named.
+        named = ""
+        for tok in w {
+            if tok == "open" or tok == "launch" or tok == "start" { continue }
+            if do_browsers()[tok] != null { named = tok }
+        }
+        if named != "" or do_after(u, "open") != "" {
+            c = do_open(w, u)
+            if c != "" { return {"cmd": c, "what": "open"} }
+        }
+        return {}
+    }
+
+    // ------------------------------------------------------------------ sizes
+    // Two different questions share the same words, and conflating them gives
+    // the wrong answer for both: "how much space is left" is the filesystem
+    // (`df -h`), while "how big is /etc" is that directory (`du`). A named path
+    // decides it.
+    if do_has_all(w, ["how", "big"]) or do_has_all(w, ["disk", "usage"]) or
+       do_has_all(w, ["taking", "space"]) or do_has_all(w, ["taking", "up"]) or
+       do_has(w, "biggest") or do_has(w, "largest") or do_has(w, "smallest") or
+       do_has(w, "huge") {
+        d = do_dir_in(w, u)
+        // A path the person named is what they want measured. Bare "disk space"
+        // is the filesystem instead.
+        named = do_path_in(u)
+        if named != "" and file.exists(named) {
+            return {"cmd": "du -h --max-depth=1 " + named + " 2>/dev/null | sort -rh | head -20",
+                    "what": "size"}
+        }
+        if do_has(w, "biggest") or do_has(w, "largest") or do_has(w, "smallest") {
+            base = named != "" ? named : d
+            if file.exists(base) {
+                return {"cmd": "du -h --max-depth=1 " + base +
+                                " 2>/dev/null | sort -rh | head -20",
+                        "what": "size"}
+            }
+        }
+        if d != "" and d != "." and file.exists(d) {
+            return {"cmd": "du -h --max-depth=1 " + d + " 2>/dev/null | sort -rh | head -20",
+                    "what": "size"}
+        }
+        return {"cmd": "df -h", "what": "size"}
+    }
+    // Free space on the disk, with nothing named to measure.
+    if do_has(w, "disk") or do_has(w, "df") {
+        return {"cmd": "df -h", "what": "size"}
+    }
+
+    // ------------------------------------------------------------ memory/cpu
+    if do_any(w, ["memory", "ram", "swap"]) {
+        if do_has(w, "memory") or do_has(w, "ram") {
+            return {"cmd": "free -h", "what": "memory"}
+        }
+    }
+    if do_has(w, "cpu") or do_has_all(w, ["top", "processes"]) or
+       do_has_all(w, ["most", "cpu"]) {
+        if do_have("ps") {
+            return {"cmd": "ps aux --sort=-%cpu | head -15", "what": "cpu"}
+        }
+        return {"cmd": "top -bn1 | head -20", "what": "cpu"}
+    }
+    if do_has_all(w, ["what", "running"]) or do_has_all(w, ["whats", "running"]) or
+       do_has(w, "processes") {
+        return {"cmd": "ps aux | head -25", "what": "processes"}
+    }
+
+    // ------------------------------------------------------------------ ports
+    // "what is using port 8080", "who is listening on 8080".
+    port = ""
+    for tok in w {
+        if len(tok) > 4 and tok.slice(0, 4) == "port" and tok.slice(4, len(tok)) != "" {
+            port = tok.slice(4, len(tok))
+        }
+    }
+    if port == "" {
+        for tok in w {
+            if tok.contains(":") { port = tok.slice(tok.indexof(":") + 1, len(tok)) }
+        }
+    }
+    if port == "" {
+        // "on 8080" / "port 8080" -- the number after the keyword.
+        i = 0
+        while i < len(w) {
+            if w[i] == "port" or w[i] == "on" {
+                if i + 1 < len(w) and do_is_number(w[i + 1]) {
+                    port = w[i + 1]
+                    break
+                }
+            }
+            i = i + 1
+        }
+    }
+    if port != "" and (do_has(w, "port") or do_has(w, "listening") or
+                       do_has(w, "using") or do_has(w, "who")) {
+        if do_have("ss") {
+            return {"cmd": "ss -ltnp 2>/dev/null | grep ':" + port + "'",
+                    "what": "port"}
+        }
+        return {"cmd": "netstat -ltnp 2>/dev/null | grep ':" + port + "'",
+                "what": "port"}
+    }
+    if do_has(w, "listening") or do_has_all(w, ["open", "ports"]) {
+        if do_have("ss") { return {"cmd": "ss -ltnp", "what": "ports"} }
+        return {"cmd": "netstat -ltnp", "what": "ports"}
+    }
+
+    // ----------------------------------------------------------------- files
+    // "what is in X", "show me X", "read X", "cat X". Files only: "what is in
+    // /etc" is a listing, and `cat` on a directory is an error that looks like a
+    // broken agent.
+    if do_has(w, "cat") or do_has_all(w, ["what", "in"]) or
+       do_has_all(w, ["whats", "in"]) or do_has_all(w, ["read", "the"]) or
+       do_has_all(w, ["show", "me"]) or do_has_all(w, ["contents", "of"]) {
+        p = do_path_in(u)
+        if p != "" and file.exists(p) {
+            r = os.run("test -f " + p + " && echo file || echo other")
+            if r["ok"] and r["stdout"].trim() == "file" {
+                return {"cmd": "cat " + p, "what": "read"}
+            }
+        }
+    }
+    // "list files in X", "ls X".
+    if do_has(w, "ls") or do_has_all(w, ["list", "files"]) or
+       do_has_all(w, ["list", "the"]) or do_has_all(w, ["what", "files"]) or
+       do_has_all(w, ["whats", "files"]) or do_has(w, "directory") {
+        d = do_dir_in(w, u)
+        if do_has(w, "ls") and do_path_in(u) == "" {
+            // A bare "ls" is a command the person typed themselves.
+            return {"cmd": "ls -la", "what": "list"}
+        }
+        if do_has(w, "directory") and !do_has(w, "in") and do_path_in(u) == "" {
+            return {"cmd": "ls -la", "what": "list"}
+        }
+        return {"cmd": "ls -la " + d, "what": "list"}
+    }
+
+    // ------------------------------------------------------------------ find
+    if do_has(w, "find") {
+        // "find X" -- the thing to look for is a filename.
+        name = do_after(u, "find")
+        if name != "" {
+            first = name.split(" ")[0].trim()
+            if first != "" and !first.startswith("/") and len(first) > 1 {
+                return {"cmd": "find ~ -name '*" + first + "*' 2>/dev/null | head -20",
+                        "what": "find"}
+            }
+        }
+    }
+
+    // -------------------------------------------------------------- searching
+    if do_has(w, "grep") or do_has(w, "search") {
+        // "search for X in /path" -- grep is the tool, and the path decides the
+        // scope so a search of the whole filesystem is never a surprise.
+        term = do_after(u, "for")
+        if term == "" { term = do_after(u, "search") }
+        if term != "" {
+            first = term.split(" ")[0].trim()
+            scope = do_path_in(u)
+            if scope == "" { scope = "." }
+            if first != "" {
+                return {"cmd": "grep -rn '" + first + "' " + scope + " 2>/dev/null | head -30",
+                        "what": "grep"}
+            }
+        }
+    }
+
+    // ----------------------------------------------------------------- misc
+    if do_has(w, "git") {
+        if file.exists(".git") or do_have("git") {
+            return {"cmd": "git status", "what": "git"}
+        }
+    }
+    if do_has_all(w, ["ip", "address"]) or do_has_all(w, ["my", "ip"]) {
+        if do_have("ip") { return {"cmd": "ip -brief addr", "what": "net"} }
+        return {"cmd": "hostname -I", "what": "net"}
+    }
+    if do_has(w, "uptime") { return {"cmd": "uptime", "what": "uptime"} }
+    if do_has_all(w, ["who", "am", "i"]) { return {"cmd": "whoami", "what": "who"} }
+    if do_has(w, "kernel") or do_has(w, "uname") {
+        return {"cmd": "uname -a", "what": "kernel"}
+    }
+    if do_has(w, "date") or do_has_all(w, ["what", "time"]) {
+        return {"cmd": "date", "what": "date"}
+    }
+    if do_has_all(w, ["env", "variables"]) or do_has(w, "printenv") {
+        return {"cmd": "env | sort", "what": "env"}
+    }
+
+    // A question with nothing behind it. {} tells the caller to ask the model.
+    return {}
+}
+
+// True when the token is only digits -- a port number, not a word.
+
+// ------------------------------------------------------------------- extract
+
+// The fenced code blocks in a reply.
+//
+// The fence may carry a language or not, and it may be unterminated -- a reply
+// cut off by the token limit still has the command at its top, and losing the
+// whole block over a missing fence would lose the usable part.
+function do_fences(text) {
+    out = []
+    inside = false
+    body = []
+    for line in text.split("\n") {
+        t = line.trim()
+        if !inside {
+            if t.startswith("```") {
+                inside = true
+                body = []
+            }
+        } else {
+            if t.startswith("```") {
+                inside = false
+                block = do_join(body, "\n").trim()
+                if block != "" { out.push(block) }
+            } else {
+                body.push(line)
+            }
+        }
+    }
+    if inside {
+        block = do_join(body, "\n").trim()
+        if block != "" { out.push(block) }
+    }
+    return out
+}
+
+// The spans in backticks. "you can run `du -sh /etc`" carries a command here,
+// and backticks are the habit when someone writes inline rather than in a block.
+function do_backticks(text) {
+    out = []
+    rest = text
+    while true {
+        a = rest.indexof("`")
+        if a < 0 { break }
+        b = rest.indexof("`", a + 1)
+        if b < 0 { break }
+        span = rest.slice(a + 1, b).trim()
+        if span != "" { out.push(span) }
+        rest = rest.slice(b + 1, len(rest))
+    }
+    return out
+}
+
+// The commands a reply left lying around, in order.
+//
+// This is the rescue: a model that answers in prose still very often puts the
+// command it is describing into a fence or backticks. Those are real, runnable
+// answers, and running them is the difference between an agent and a chatbot.
+function do_extract_commands(text) {
+    out = []
+    for block in do_fences(text) {
+        for line in block.split("\n") {
+            c = line.trim()
+            if c == "" { continue }
+            if c == "```" { continue }
+            // A prompt or a comment is not the command.
+            if c.startswith("$ ") { c = c.slice(2, len(c)).trim() }
+            if c.startswith("> ") { c = c.slice(2, len(c)).trim() }
+            if c.startswith("#") { continue }
+            if c == "" { continue }
+            out.push(c)
+        }
+    }
+    if len(out) == 0 {
+        for span in do_backticks(text) {
+            for line in span.split("\n") {
+                c = line.trim()
+                if c != "" { out.push(c) }
+            }
+        }
+    }
+    return out
+}

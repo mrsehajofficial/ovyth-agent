@@ -27,6 +27,8 @@
 
 import "ai"
 import "agent/guard"
+import "agent/json"
+import "agent/do"
 
 // ------------------------------------------------------------------- style
 
@@ -141,7 +143,9 @@ system = "You are Ovyth, an agent running in a Linux terminal. You have four too
     "  {\"say\": \"<text>\"}            answer the user in words\n" +
     "Prefer fewer commands. Read before you write. If a command fails, read the\n" +
     "error and try something else. Never invent output you did not observe.\n" +
-    "You are talking to a person, so answers should be short and concrete."
+    "You are talking to a person, so answers should be short and concrete.\n" +
+    "You cannot open windows or see a screen. Saying you are a text assistant\n" +
+    "is a wrong answer -- if you can do it with a command, send the command."
 
 history = ai_conversation(system)
 
@@ -249,6 +253,7 @@ function commands(text) {
 // ---------------------------------------------------------------- main loop
 
 while true {
+    budget = 12
     line = input("you> ")
     if line == null { break }        // EOF: a pipe that ran out
     line = line.trim()
@@ -288,10 +293,76 @@ while true {
         continue
     }
 
+    // The deterministic layer first. An utterance this machine can answer
+    // without a model is answered by this machine: "open chrome" resolves to
+    // whatever browser is installed, "how big is /etc" to a du the agent runs
+    // itself. Asking the model first is how you get "I cannot open Google
+    // Chrome because I am running as an AI text assistant" -- true about the
+    // model, useless to the person, and it is a sentence the agent now never
+    // has to receive.
+    hit = do_resolve(line)
+    if hit["cmd"] != null {
+        g = guard(hit["cmd"])
+        if !g["ok"] {
+            refused(g["why"])
+        } else {
+            result = run_tool({"cmd": hit["cmd"]})
+            // A command run for its own sake is reported; a question is fed
+            // back so the model can put it in words. Both show the command and
+            // its exit status, which is the point.
+            if !do_is_question(do_words(line)) {
+                // Nothing to summarise: the command was the answer.
+            } else {
+                ai_ask(history, "You asked with a command, this ran:\n" +
+                                "  " + hit["cmd"] + "\n" + result +
+                                "\nNow answer in one short sentence. Do not " +
+                                "claim you cannot run anything.")
+                while budget > 0 {
+                    budget = budget - 1
+                    r = ai_request(url, key, model, ai_trim(history, 16), 60.0)
+                    if !r["ok"] {
+                        print("  ✖ model error: " + r["error"])
+                        break
+                    }
+                    reply = r["text"].trim()
+                    start = reply.indexof("{")
+                    call = {}
+                    if start < 0 {
+                        // No protocol: say it, because the command already ran
+                        // and the answer is real even if the model is chatty.
+                        side("Ovyth: " + reply)
+                        break
+                    }
+                    end = json_end(reply, start)
+                    if end < 0 { side("Ovyth: " + reply); break }
+                    try {
+                        call = json.parse(reply.slice(start, end + 1))
+                    } catch e {
+                        side("Ovyth: " + reply)
+                        break
+                    }
+                    if call["say"] != null {
+                        side("Ovyth: " + call["say"])
+                        ai_told(history, call["say"])
+                        break
+                    }
+                    if call["cmd"] != null {
+                        rg = guard(call["cmd"])
+                        if !rg["ok"] { refused(rg["why"]); break }
+                        ai_ask(history, run_tool({"cmd": call["cmd"]}))
+                        continue
+                    }
+                    side("Ovyth: " + reply)
+                    break
+                }
+            }
+        }
+        continue
+    }
+
     ai_ask(history, line)
 
     // The model may take several tool turns before it answers.
-    budget = 12
     nudges = 0
     while budget > 0 {
         budget = budget - 1
@@ -308,6 +379,43 @@ while true {
         // were an answer.
         start = reply.indexof("{")
         if start < 0 {
+            // The reply is prose. Before nudging the model back to the
+            // protocol, look for a command it may have left in a fence or in
+            // backticks: a model asked for sizes very often answers in words
+            // *and* writes du -h --max-depth=1 into a bash block. That command
+            // is an answer the agent can act on, and discarding it is how an
+            // agent ends up shrugging at something already sitting in front
+            // of it.
+            found = do_extract_commands(reply)
+            if len(found) > 0 {
+                ran = 0
+                observations = []
+                call = {}
+                for c in found {
+                    if ran >= 3 { break }
+                    g = guard(c)
+                    if !g["ok"] {
+                        refused(g["why"])
+                        continue
+                    }
+                    observations.push(run_tool({"cmd": c}))
+                    ran = ran + 1
+                }
+                if ran > 0 {
+                    ai_told(history, reply)
+                    ai_ask(history, "These commands ran:\n" +
+                                    do_join(observations, "\n---\n") +
+                                    "\nAnswer in one short sentence from what " +
+                                    "you actually observed. Do not claim you " +
+                                    "cannot run anything.")
+                    r2 = ai_request(url, key, model, ai_trim(history, 16), 60.0)
+                    if r2["ok"] {
+                        print("")
+                        side("Ovyth: " + r2["text"].trim())
+                    }
+                    break
+                }
+            }
             nudges = nudges + 1
             if nudges > 2 {
                 side(reply)
