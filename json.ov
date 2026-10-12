@@ -1,0 +1,64 @@
+// agent :: json.ov
+//
+// Reading one JSON object out of a model's reply.
+//
+// A model asked for "one JSON object" does not reliably send one. It wraps it in
+// prose, drops it in a fence, doubles its closing brace, and on a long answer
+// sometimes never closes it at all. Every one of those is a parse failure unless
+// the bracketing is done properly, and a parse failure used to kill the agent.
+//
+//   import "agent/json"
+//   end = json_end(reply, reply.indexof("{"))
+//
+// json_end finds the "}" that closes the object starting at `start`: balanced,
+// and string-aware, so braces inside a string value do not confuse the count.
+// Returns -1 when the object is never closed -- the truncated-reply case.
+//
+// Why not just take the last "}" in the reply? Because a model that doubles its
+// closing brace is common (gemini does it), and `{"done": "..."}}` is then fed to
+// json.parse as-is, which throws.
+
+// The position of the "}" that closes the JSON object starting at `start`.
+//
+// String-aware: a brace inside a string is data, not structure, and counting it
+// would close the object early. Escape-aware for the same reason -- `\"` does not
+// end a string.
+function json_end(text, start) {
+    depth = 0
+    in_str = false
+    escape = false
+    i = start
+    while i < len(text) {
+        c = text[i]
+        if in_str {
+            if escape {
+                escape = false
+            } else if c == "\\" {
+                escape = true
+            } else if c == "\"" {
+                in_str = false
+            }
+        } else if c == "\"" {
+            in_str = true
+        } else if c == "{" {
+            depth = depth + 1
+        } else if c == "}" {
+            depth = depth - 1
+            if depth == 0 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// The first complete JSON object in `text`, or "" when there is not one.
+//
+// The whole bracketing step in one call, which is what callers actually want:
+// the model's reply in, the object's text out, "" when it is not there.
+function json_object(text) {
+    start = text.indexof("{")
+    if start < 0 { return "" }
+    end = json_end(text, start)
+    if end < 0 { return "" }
+    return text.slice(start, end + 1)
+}
